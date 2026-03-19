@@ -27,9 +27,9 @@ function Rank({ entry, prev, isNew }) {
   const up = prev !== null && prev > entry.rank;
   const color =
     entry.rank === 1 ? "#ffd700"
-    : entry.rank === 2 ? "#c0c0c0"
-    : entry.rank === 3 ? "#cd7f32"
-    : "#556";
+      : entry.rank === 2 ? "#c0c0c0"
+        : entry.rank === 3 ? "#cd7f32"
+          : "#556";
 
   return (
     <div
@@ -64,7 +64,7 @@ function Rank({ entry, prev, isNew }) {
 
       {/* solved */}
       <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#aaa", fontSize: "0.8rem", textAlign: "right" }}>
-        {entry.solved}<span style={{ color: "#444" }}>/20</span>
+        {entry.solved}<span style={{ color: "#444" }}>/40</span>
       </span>
 
       {/* bar */}
@@ -167,7 +167,7 @@ export default function App() {
         }
 
         setTimeout(() => setNewEntries({}), 2000);
-      } catch (_) {}
+      } catch (_) { }
     };
 
     es.onerror = () => {
@@ -237,7 +237,7 @@ export default function App() {
             🚩 CURLSCHOOL
           </h1>
           <p style={{ color: "#444", fontSize: "0.75rem", letterSpacing: 2, marginTop: 4 }}>
-            LIVE LEADERBOARD · 20 CHALLENGES · 600 PTS MAX
+            LIVE LEADERBOARD · 40 CHALLENGES · 600 PTS MAX
           </p>
         </div>
 
@@ -287,7 +287,7 @@ export default function App() {
           { label: "PLAYERS", value: totalStudents },
           { label: "TOP SCORE", value: `${topScore}pts` },
           { label: "MAX POSSIBLE", value: "600pts" },
-          { label: "CHALLENGES", value: "20" },
+          { label: "CHALLENGES", value: "40" },
         ].map(s => (
           <div key={s.label}>
             <div style={{ fontSize: "0.6rem", color: "#444", letterSpacing: 2 }}>{s.label}</div>
