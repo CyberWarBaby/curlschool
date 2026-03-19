@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +21,7 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════════
-//  CHALLENGES
+//  CHALLENGES  (original 20 + new 20)
 // ═══════════════════════════════════════════════════════════════════
 
 type Challenge struct {
@@ -33,6 +36,7 @@ type Challenge struct {
 }
 
 var challenges = []Challenge{
+	// ── original 20 ─────────────────────────────────────────────
 	{1, "ping", "easy", 10, "GET", "/ping", "Wake the server up", "FLAG{alive_and_kicking}"},
 	{2, "get_all", "easy", 10, "GET", "/notes", "List every note (token required)", "FLAG{curl_gets_it_all}"},
 	{3, "get_one", "easy", 10, "GET", "/notes/1", "Read a single note by ID (token required)", "FLAG{one_note_at_a_time}"},
@@ -53,6 +57,27 @@ var challenges = []Challenge{
 	{18, "head", "hard", 50, "HEAD", "/notes", "Send a HEAD request to /notes — check the response headers", "FLAG{head_not_get_big_brain}"},
 	{19, "multi_hdr", "hard", 50, "GET", "/echo", "Hit /echo with X-Student, Authorization AND User-Agent all set", "FLAG{triple_header_threat}"},
 	{20, "leaderboard", "hard", 50, "GET", "/leaderboard", "Call GET /leaderboard and find your name on it", "FLAG{i_can_see_myself_winning}"},
+	// ── new 20 ──────────────────────────────────────────────────
+	{21, "basic_auth", "mid", 25, "GET", "/basic-login", "Use HTTP Basic Auth (-u username:password) to authenticate", "FLAG{basic_auth_old_but_gold}"},
+	{22, "wrong_method", "mid", 25, "POST", "/ping", "Trigger a 405 on /ping then fix it with the correct method", "FLAG{method_matters_always}"},
+	{23, "redirect", "mid", 25, "GET", "/moved", "Follow the redirect with -L and land on the real page", "FLAG{follow_the_leader}"},
+	{24, "resp_header", "mid", 25, "GET", "/secret-header", "Use -i and read the X-Secret-Token response header value", "FLAG{headers_hide_secrets}"},
+	{25, "form_submit", "mid", 25, "POST", "/form", "Submit URL-encoded form data: name=YOUR_NAME&course=curl101", "FLAG{forms_are_just_strings}"},
+	{26, "query_and_hdr", "mid", 25, "GET", "/combo", "Send both ?mode=strict AND X-Api-Version: 2 together", "FLAG{query_plus_header_combo}"},
+	{27, "two_hdrs", "mid", 25, "GET", "/double-check", "Send both X-First: alpha AND X-Second: beta headers", "FLAG{two_headers_one_request}"},
+	{28, "json_validation", "mid", 25, "POST", "/validated", "POST JSON with title (string), author (string), year (number)", "FLAG{schema_validation_passed}"},
+	{29, "trigger_401", "mid", 25, "GET", "/notes", "Hit /notes without a token (get 401), then fix it", "FLAG{401_then_fixed}"},
+	{30, "trigger_400", "mid", 25, "POST", "/notes", "POST /notes with missing title (get 400), then fix it", "FLAG{400_then_fixed}"},
+	{31, "cookie_save", "mid", 25, "POST", "/cookie-login", "Login via /cookie-login and save the cookie with -c cookies.txt", "FLAG{cookies_saved_to_jar}"},
+	{32, "cookie_reuse", "mid", 25, "GET", "/cookie-protected", "Send the saved cookie to /cookie-protected with -b cookies.txt", "FLAG{session_cookie_rides_again}"},
+	{33, "useragent_check", "mid", 25, "GET", "/agent-check", "Send a User-Agent that starts with Mozilla to /agent-check", "FLAG{fake_it_till_you_make_it}"},
+	{34, "accept_json", "mid", 25, "GET", "/content-deal", "Hit /content-deal with Accept: application/json to get JSON back", "FLAG{accept_json_get_json}"},
+	{35, "put_idempotent", "mid", 25, "PUT", "/notes/1", "PUT the same payload to /notes/1 twice — prove idempotency", "FLAG{idempotency_means_same_result}"},
+	{36, "patch_vs_put", "mid", 25, "PATCH", "/notes/1", "PATCH only the body field of note 1 — compare with PUT", "FLAG{patch_is_surgical_put_is_nuclear}"},
+	{37, "head_vs_get", "mid", 25, "HEAD", "/notes/1", "HEAD /notes/1 — headers only, no body (compare with GET)", "FLAG{head_saves_bandwidth}"},
+	{38, "pagination", "mid", 25, "GET", "/notes", "Hit GET /notes?page=1&limit=2 for paginated results", "FLAG{pagination_keeps_it_clean}"},
+	{39, "sorting", "mid", 25, "GET", "/notes", "Hit GET /notes?sort=desc for descending order", "FLAG{sorted_like_a_pro}"},
+	{40, "mini_boss", "hard", 50, "GET", "/boss", "One shot: Bearer token + ?level=hard + X-Boss: true + Accept: application/json", "FLAG{boss_defeated_curl_master}"},
 }
 
 func challengeByKey(key string) *Challenge {
@@ -65,7 +90,7 @@ func challengeByKey(key string) *Challenge {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SSE hub — pushes leaderboard JSON to React frontend
+//  SSE hub
 // ═══════════════════════════════════════════════════════════════════
 
 type sseHub struct {
@@ -108,10 +133,13 @@ func broadcastLeaderboard() {
 		Solved   int    `json:"solved"`
 		Medal    string `json:"medal"`
 	}
+	// Tie-break: same points → whoever reached that score FIRST ranks higher
 	rows, err := db.Query(`
 		SELECT u.username, u.points,
 		       (SELECT COUNT(*) FROM solved s WHERE s.username=u.username) as solved
-		FROM users u ORDER BY u.points DESC, solved DESC, u.created_at ASC LIMIT 50`)
+		FROM users u
+		ORDER BY u.points DESC, u.last_points_at ASC, u.created_at ASC
+		LIMIT 50`)
 	if err != nil {
 		return
 	}
@@ -148,6 +176,11 @@ func broadcastLeaderboard() {
 
 var db *sql.DB
 
+func hashPassword(pw string) string {
+	h := sha256.Sum256([]byte(pw))
+	return hex.EncodeToString(h[:])
+}
+
 func initDB(path string) {
 	var err error
 	db, err = sql.Open("sqlite3", path+"?_journal=WAL&_timeout=5000")
@@ -157,11 +190,14 @@ func initDB(path string) {
 	db.SetMaxOpenConns(1)
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS users (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			username   TEXT    UNIQUE NOT NULL,
-			token      TEXT    UNIQUE NOT NULL,
-			points     INTEGER DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			username       TEXT    UNIQUE NOT NULL,
+			password_hash  TEXT    NOT NULL DEFAULT '',
+			token          TEXT    UNIQUE NOT NULL,
+			session_token  TEXT    UNIQUE,
+			points         INTEGER DEFAULT 0,
+			last_points_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS notes (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,6 +215,10 @@ func initDB(path string) {
 	if err != nil {
 		log.Fatalf("db init: %v", err)
 	}
+	// Safe migrations for existing DBs that lack the new columns
+	db.Exec(`ALTER TABLE users ADD COLUMN password_hash  TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE users ADD COLUMN session_token  TEXT UNIQUE`)
+	db.Exec(`ALTER TABLE users ADD COLUMN last_points_at DATETIME DEFAULT CURRENT_TIMESTAMP`)
 }
 
 func generateToken() string {
@@ -193,12 +233,26 @@ func lookupToken(token string) string {
 	return u
 }
 
+func lookupSessionToken(token string) string {
+	var u string
+	db.QueryRow(`SELECT username FROM users WHERE session_token=?`, token).Scan(&u)
+	return u
+}
+
 func bearerToken(r *http.Request) string {
 	p := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
 	if len(p) == 2 && strings.EqualFold(p[0], "bearer") {
 		return p[1]
 	}
 	return ""
+}
+
+func cookieToken(r *http.Request) string {
+	c, err := r.Cookie("session")
+	if err != nil {
+		return ""
+	}
+	return c.Value
 }
 
 func hasSolved(username, key string) bool {
@@ -216,7 +270,8 @@ func awardFlag(username, key string) (string, int, bool) {
 		return c.Flag, c.Points, true
 	}
 	db.Exec(`INSERT OR IGNORE INTO solved (username, challenge_key) VALUES (?,?)`, username, key)
-	db.Exec(`UPDATE users SET points=points+? WHERE username=?`, c.Points, username)
+	// Update points AND the timestamp used for tie-breaking
+	db.Exec(`UPDATE users SET points=points+?, last_points_at=CURRENT_TIMESTAMP WHERE username=?`, c.Points, username)
 	go broadcastLeaderboard()
 	return c.Flag, c.Points, false
 }
@@ -234,7 +289,7 @@ func solvedCount(username string) int {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  NOTES
+//  NOTES helpers
 // ═══════════════════════════════════════════════════════════════════
 
 type Note struct {
@@ -259,8 +314,20 @@ func seedNotes() {
 	log.Println("🌱 seeded 3 starter notes")
 }
 
-func getAllNotes() []Note {
-	rows, _ := db.Query(`SELECT id, title, body, created_at FROM notes ORDER BY id`)
+func getAllNotes(page, limit int, sortDir string) []Note {
+	if limit <= 0 {
+		limit = 100
+	}
+	if page <= 0 {
+		page = 1
+	}
+	order := "ASC"
+	if strings.ToLower(sortDir) == "desc" {
+		order = "DESC"
+	}
+	offset := (page - 1) * limit
+	q := fmt.Sprintf(`SELECT id, title, body, created_at FROM notes ORDER BY id %s LIMIT ? OFFSET ?`, order)
+	rows, _ := db.Query(q, limit, offset)
 	if rows == nil {
 		return []Note{}
 	}
@@ -285,7 +352,7 @@ func getNoteByID(id int) (*Note, bool) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  RESPONSE HELPERS
+//  Response helpers
 // ═══════════════════════════════════════════════════════════════════
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -335,7 +402,7 @@ func flagResp(username, key string, extra map[string]any) map[string]any {
 		"flag":            flag,
 		"points_earned":   pts,
 		"your_total":      userPoints(username),
-		"challenges_done": fmt.Sprintf("%d/20", solvedCount(username)),
+		"challenges_done": fmt.Sprintf("%d/%d", solvedCount(username), len(challenges)),
 	}
 	if already {
 		res["note"] = "Already solved — no extra points."
@@ -353,7 +420,7 @@ func requireAuth(w http.ResponseWriter, r *http.Request) string {
 	if token == "" {
 		writeJSON(w, 401, map[string]any{
 			"error": "Token required.",
-			"hint":  "POST /login first, then add: -H \"Authorization: Bearer YOUR_TOKEN\"",
+			"hint":  `POST /login first, then add: -H "Authorization: Bearer YOUR_TOKEN"`,
 		})
 		return ""
 	}
@@ -368,15 +435,33 @@ func requireAuth(w http.ResponseWriter, r *http.Request) string {
 	return username
 }
 
+func requireCookieAuth(w http.ResponseWriter, r *http.Request) string {
+	st := cookieToken(r)
+	if st == "" {
+		writeJSON(w, 401, map[string]any{
+			"error": "Session cookie required.",
+			"hint":  "POST /cookie-login with -c cookies.txt first, then use -b cookies.txt here.",
+		})
+		return ""
+	}
+	username := lookupSessionToken(st)
+	if username == "" {
+		writeJSON(w, 401, map[string]any{
+			"error": "Session cookie not recognised or expired.",
+			"hint":  "POST /cookie-login again to get a fresh cookie.",
+		})
+		return ""
+	}
+	return username
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  GET /
 // ═══════════════════════════════════════════════════════════════════
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		writeJSON(w, 404, map[string]any{
-			"error": fmt.Sprintf("No route: %s %s", r.Method, r.URL.Path),
-		})
+		writeJSON(w, 404, map[string]any{"error": fmt.Sprintf("No route: %s %s", r.Method, r.URL.Path)})
 		return
 	}
 	type CI struct {
@@ -399,95 +484,123 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 			hard = append(hard, ci)
 		}
 	}
+	maxScore := 0
+	for _, c := range challenges {
+		maxScore += c.Points
+	}
 	writeJSON(w, 200, map[string]any{
-		"welcome":       "🚩 CurlSchool — 20 challenges, 600pts max",
-		"start":         "POST /login with your name to get a token",
+		"welcome":       fmt.Sprintf("🚩 CurlSchool — %d challenges, %dpts max", len(challenges), maxScore),
+		"start":         `POST /login with {"username":"...","password":"..."} to get a token`,
 		"scoring":       map[string]any{"easy": "10pts", "mid": "25pts", "hard": "50pts"},
 		"easy_1_to_10":  easy,
-		"mid_11_to_16":  mid,
-		"hard_17_to_20": hard,
+		"mid_11_to_39":  mid,
+		"hard_17_20_40": hard,
 	})
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  POST /login
+//  POST /login  — now requires password; username is UNIQUE
 // ═══════════════════════════════════════════════════════════════════
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, 405, map[string]any{
-			"error": fmt.Sprintf("Method %s not allowed.", r.Method),
-		})
+		writeJSON(w, 405, map[string]any{"error": fmt.Sprintf("Method %s not allowed.", r.Method)})
 		return
 	}
-
 	ct := r.Header.Get("Content-Type")
 	raw, _ := io.ReadAll(r.Body)
-
 	if !strings.Contains(ct, "application/json") {
-		writeJSON(w, 400, map[string]any{
-			"error": "Expected Content-Type: application/json.",
-			"got":   ct,
-		})
+		writeJSON(w, 400, map[string]any{"error": "Expected Content-Type: application/json.", "got": ct})
 		return
 	}
-
 	var body struct {
 		Username string `json:"username"`
+		Password string `json:"password"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		writeJSON(w, 400, map[string]any{
-			"error":   "Could not parse JSON body.",
-			"details": err.Error(),
-		})
+		writeJSON(w, 400, map[string]any{"error": "Could not parse JSON body.", "details": err.Error()})
 		return
 	}
-
 	username := strings.TrimSpace(body.Username)
+	password := strings.TrimSpace(body.Password)
 	if username == "" {
 		writeJSON(w, 400, map[string]any{"error": "Field 'username' is required."})
 		return
 	}
-
-	var existing string
-	if err := db.QueryRow(`SELECT token FROM users WHERE username=?`, username).Scan(&existing); err == nil {
-		writeJSON(w, 200, map[string]any{
-			"message":         fmt.Sprintf("👋 Welcome back %s!", username),
-			"token":           existing,
-			"points":          userPoints(username),
-			"challenges_done": fmt.Sprintf("%d/20", solvedCount(username)),
+	if password == "" {
+		writeJSON(w, 400, map[string]any{
+			"error": "Field 'password' is required.",
+			"hint":  "Choose a password — you will need it to log in again.",
 		})
 		return
 	}
 
-	token := generateToken()
-	if _, err := db.Exec(`INSERT INTO users (username, token) VALUES (?,?)`, username, token); err != nil {
-		writeJSON(w, 500, map[string]any{"error": "DB error."})
+	pwHash := hashPassword(password)
+
+	// Check whether username already exists
+	var existingHash, existingToken string
+	err := db.QueryRow(`SELECT password_hash, token FROM users WHERE username=?`, username).
+		Scan(&existingHash, &existingToken)
+
+	if err == nil {
+		// Username taken — verify password
+		if existingHash != pwHash {
+			writeJSON(w, 401, map[string]any{
+				"error": "Wrong password for this username.",
+				"hint":  "Usernames are unique. Use your original password, or pick a different username.",
+			})
+			return
+		}
+		// Correct password → return existing token
+		writeJSON(w, 200, map[string]any{
+			"message":         fmt.Sprintf("👋 Welcome back %s!", username),
+			"token":           existingToken,
+			"points":          userPoints(username),
+			"challenges_done": fmt.Sprintf("%d/%d", solvedCount(username), len(challenges)),
+		})
 		return
 	}
 
+	// New user → register
+	token := generateToken()
+	if _, err := db.Exec(`INSERT INTO users (username, password_hash, token) VALUES (?,?,?)`, username, pwHash, token); err != nil {
+		writeJSON(w, 500, map[string]any{"error": "DB error — username may already be taken."})
+		return
+	}
 	writeJSON(w, 201, map[string]any{
-		"message":  fmt.Sprintf("🎉 Welcome %s! Save your token.", username),
+		"message":  fmt.Sprintf("🎉 Welcome %s! Save your token AND your password.", username),
 		"username": username,
 		"token":    token,
-		"warning":  "Don't lose this. POST /login again with same username if you do.",
+		"warning":  "Usernames are unique. Don't lose your password — you need it to log in again.",
 	})
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  GET /ping — Challenge 1
+//  GET /ping — Challenge 1  (POST returns 405 → C22 teaching moment)
 // ═══════════════════════════════════════════════════════════════════
 
 func handlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{
+			"error": fmt.Sprintf("Method %s not allowed on /ping.", r.Method),
+			"hint":  "Challenge 22: you found the 405! Now fix it — use GET /ping.",
+		})
+		return
+	}
 	res := map[string]any{
 		"status":  "🟢 alive",
 		"time":    time.Now().Format(time.RFC3339),
 		"message": "pong!",
 	}
-	if username := lookupToken(bearerToken(r)); username != "" {
+	username := lookupToken(bearerToken(r))
+	if username != "" {
 		for k, v := range flagResp(username, "ping", nil) {
 			res[k] = v
 		}
+		// C22: award once they used the right method
+		res["flag_22"] = flagResp(username, "wrong_method", map[string]any{
+			"note": "You fixed the 405 by switching to the correct GET method!",
+		})
 	}
 	writeJSON(w, 200, res)
 }
@@ -518,22 +631,14 @@ func handleEcho(w http.ResponseWriter, r *http.Request) {
 	for k, v := range r.URL.Query() {
 		params[k] = strings.Join(v, ", ")
 	}
-
 	token := bearerToken(r)
 	username := lookupToken(token)
-
 	res := map[string]any{
-		"mirror": map[string]any{
-			"method":  r.Method,
-			"params":  params,
-			"headers": headers,
-		},
+		"mirror": map[string]any{"method": r.Method, "params": params, "headers": headers},
 	}
-
 	studentParam := r.URL.Query().Get("student")
 	xStudent := r.Header.Get("X-Student")
 	isCurlMaster := strings.Contains(r.Header.Get("User-Agent"), "CurlMaster")
-
 	if studentParam != "" && username != "" {
 		res["flag_6"] = flagResp(username, "query", nil)
 	}
@@ -546,16 +651,14 @@ func handleEcho(w http.ResponseWriter, r *http.Request) {
 	if token != "" && username != "" {
 		res["flag_11"] = flagResp(username, "auth_echo", nil)
 	}
-	// Challenge 19: all three simultaneously
 	if xStudent != "" && token != "" && isCurlMaster && username != "" {
 		res["flag_19"] = flagResp(username, "multi_hdr", nil)
 	}
-
 	writeJSON(w, 200, res)
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  GET /leaderboard — Challenge 20  +  SSE stream
+//  GET /leaderboard — Challenge 20 + SSE stream
 // ═══════════════════════════════════════════════════════════════════
 
 func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
@@ -569,7 +672,9 @@ func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	rows, _ := db.Query(`
 		SELECT u.username, u.points,
 		       (SELECT COUNT(*) FROM solved s WHERE s.username=u.username) as solved
-		FROM users u ORDER BY u.points DESC, solved DESC, u.created_at ASC LIMIT 50`)
+		FROM users u
+		ORDER BY u.points DESC, u.last_points_at ASC, u.created_at ASC
+		LIMIT 50`)
 	var board []Entry
 	rank := 1
 	if rows != nil {
@@ -595,11 +700,15 @@ func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	if board == nil {
 		board = []Entry{}
 	}
-
+	maxScore := 0
+	for _, c := range challenges {
+		maxScore += c.Points
+	}
 	res := map[string]any{
 		"leaderboard": board,
 		"total":       rank - 1,
-		"max_score":   600,
+		"max_score":   maxScore,
+		"tiebreaker":  "Equal points → first to reach that score ranks higher",
 	}
 	if username := lookupToken(bearerToken(r)); username != "" {
 		res["your_flag"] = flagResp(username, "leaderboard", nil)
@@ -612,21 +721,16 @@ func handleLeaderboardStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", 500)
 		return
 	}
-
 	ch := hub.subscribe()
 	defer hub.unsubscribe(ch)
-
-	go broadcastLeaderboard() // push current state on connect
-
+	go broadcastLeaderboard()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case data := <-ch:
@@ -675,14 +779,14 @@ func handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"username":        username,
 		"points":          userPoints(username),
-		"challenges_done": fmt.Sprintf("%d/20", len(solved)),
+		"challenges_done": fmt.Sprintf("%d/%d", len(solved), len(challenges)),
 		"solved":          solved,
 		"remaining":       remaining,
 	})
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  /notes collection — Challenges 2, 4, 12, 13, 14, 16, 18
+//  /notes — Challenges 2,4,12,13,14,16,18,29,30,38,39
 // ═══════════════════════════════════════════════════════════════════
 
 func handleNotes(w http.ResponseWriter, r *http.Request) {
@@ -690,17 +794,31 @@ func handleNotes(w http.ResponseWriter, r *http.Request) {
 	if username == "" {
 		return
 	}
-
 	switch r.Method {
 
 	case http.MethodGet:
+		pageStr := r.URL.Query().Get("page")
+		limitStr := r.URL.Query().Get("limit")
+		sortDir := r.URL.Query().Get("sort")
+		page, _ := strconv.Atoi(pageStr)
+		limit, _ := strconv.Atoi(limitStr)
 		mu.Lock()
-		all := getAllNotes()
+		all := getAllNotes(page, limit, sortDir)
 		mu.Unlock()
 		res := flagResp(username, "get_all", map[string]any{"count": len(all), "notes": all})
+		// C29: they successfully authenticated after seeing a 401 — award here
+		res["flag_29"] = flagResp(username, "trigger_401", map[string]any{
+			"note": "You fixed the 401! Token auth working correctly.",
+		})
+		if pageStr != "" && limitStr != "" {
+			res["flag_38"] = flagResp(username, "pagination", map[string]any{"page": page, "limit": limit})
+		}
+		if sortDir != "" {
+			res["flag_39"] = flagResp(username, "sorting", map[string]any{"sort": sortDir})
+		}
 		if r.Header.Get("X-Verbose") == "true" {
 			res["flag_13"] = flagResp(username, "verbose", map[string]any{
-				"server_info": map[string]any{"db": "sqlite3", "challenges": 20},
+				"server_info": map[string]any{"db": "sqlite3", "challenges": len(challenges)},
 			})
 		}
 		if r.Header.Get("Accept") == "application/json" {
@@ -711,18 +829,14 @@ func handleNotes(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		ct := r.Header.Get("Content-Type")
 		raw, _ := io.ReadAll(r.Body)
-
-		// Challenge 16: POST without correct Content-Type — award flag and explain
 		if !strings.Contains(ct, "application/json") {
-			res := map[string]any{
+			writeJSON(w, 400, map[string]any{
 				"error":    "Content-Type header missing or incorrect.",
 				"received": ct,
 				"flag_16":  flagResp(username, "post_noct", nil),
-			}
-			writeJSON(w, 400, res)
+			})
 			return
 		}
-
 		var body struct {
 			Title string `json:"title"`
 			Body  string `json:"body"`
@@ -732,10 +846,14 @@ func handleNotes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if strings.TrimSpace(body.Title) == "" {
-			writeJSON(w, 400, map[string]any{"error": "Field 'title' is required."})
+			// C30: trigger the 400 and award it
+			writeJSON(w, 400, map[string]any{
+				"error":   "Field 'title' is required.",
+				"hint":    "Add 'title' to your JSON body and try again.",
+				"flag_30": flagResp(username, "trigger_400", map[string]any{"note": "You triggered a 400! Now fix it: add the 'title' field."}),
+			})
 			return
 		}
-
 		mu.Lock()
 		result, err := db.Exec(`INSERT INTO notes (title, body) VALUES (?,?)`, body.Title, body.Body)
 		mu.Unlock()
@@ -746,7 +864,6 @@ func handleNotes(w http.ResponseWriter, r *http.Request) {
 		id, _ := result.LastInsertId()
 		n, _ := getNoteByID(int(id))
 		res := flagResp(username, "post_note", map[string]any{"note": n})
-
 		var userPosts int
 		db.QueryRow(`SELECT COUNT(*) FROM notes WHERE id > 3`).Scan(&userPosts)
 		if userPosts >= 3 {
@@ -757,7 +874,6 @@ func handleNotes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 201, res)
 
 	case http.MethodHead:
-		// Challenge 18 — HEAD: respond with headers, no body
 		flag, pts, already := awardFlag(username, "head")
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -779,7 +895,7 @@ func handleNotes(w http.ResponseWriter, r *http.Request) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  /notes/:id — Challenges 3, 5, 9, 10, 17
+//  /notes/:id — Challenges 3,5,9,10,17,35,36,37
 // ═══════════════════════════════════════════════════════════════════
 
 func handleNote(w http.ResponseWriter, r *http.Request, id int) {
@@ -797,7 +913,6 @@ func handleNote(w http.ResponseWriter, r *http.Request, id int) {
 		})
 		return
 	}
-
 	switch r.Method {
 
 	case http.MethodGet:
@@ -821,7 +936,12 @@ func handleNote(w http.ResponseWriter, r *http.Request, id int) {
 		db.Exec(`UPDATE notes SET title=?, body=? WHERE id=?`, body.Title, body.Body, id)
 		updated, _ := getNoteByID(id)
 		mu.Unlock()
-		writeJSON(w, 200, flagResp(username, "put", map[string]any{"note": updated}))
+		res := flagResp(username, "put", map[string]any{"note": updated})
+		// C35: idempotency — award every time they PUT (flag awarded on first, "already solved" on repeats)
+		res["flag_35"] = flagResp(username, "put_idempotent", map[string]any{
+			"note": "PUT the same payload twice — result is identical. That is idempotency!",
+		})
+		writeJSON(w, 200, res)
 
 	case http.MethodPatch:
 		if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
@@ -850,7 +970,29 @@ func handleNote(w http.ResponseWriter, r *http.Request, id int) {
 		if body.Title != nil && body.Body != nil {
 			res["flag_17"] = flagResp(username, "patch_body", nil)
 		}
+		// C36: PATCH only the body field
+		if body.Body != nil && body.Title == nil {
+			res["flag_36"] = flagResp(username, "patch_vs_put", map[string]any{
+				"note": "PATCH only changed 'body'. PUT would have replaced the entire note.",
+			})
+		}
 		writeJSON(w, 200, res)
+
+	case http.MethodHead:
+		// C37: HEAD on /notes/:id
+		flag, pts, already := awardFlag(username, "head_vs_get")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("X-Note-Id", fmt.Sprintf("%d", note.ID))
+		w.Header().Set("X-Note-Title", note.Title)
+		w.Header().Set("X-Flag", flag)
+		w.Header().Set("X-Points", fmt.Sprintf("%d", pts))
+		if already {
+			w.Header().Set("X-Already-Solved", "true")
+		} else {
+			w.Header().Set("X-Congrats", congrats(username, "mid", pts))
+		}
+		w.WriteHeader(200)
 
 	case http.MethodDelete:
 		mu.Lock()
@@ -861,7 +1003,7 @@ func handleNote(w http.ResponseWriter, r *http.Request, id int) {
 	default:
 		writeJSON(w, 405, map[string]any{
 			"error":     fmt.Sprintf("Method %s not allowed.", r.Method),
-			"supported": []string{"GET", "PUT", "PATCH", "DELETE"},
+			"supported": []string{"GET", "PUT", "PATCH", "DELETE", "HEAD"},
 		})
 	}
 }
@@ -877,6 +1019,333 @@ func notesRouter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	handleNote(w, r, id)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  NEW CHALLENGE ROUTES (21-40)
+// ═══════════════════════════════════════════════════════════════════
+
+// C21: GET /basic-login
+func handleBasicLogin(w http.ResponseWriter, r *http.Request) {
+	username, password, ok := r.BasicAuth()
+	if !ok || username == "" || password == "" {
+		w.Header().Set("WWW-Authenticate", `Basic realm="CurlSchool"`)
+		writeJSON(w, 401, map[string]any{
+			"error": "HTTP Basic Auth required.",
+			"hint":  "Use: curl -u username:password http://localhost:8080/basic-login",
+		})
+		return
+	}
+	var pwHash string
+	if err := db.QueryRow(`SELECT password_hash FROM users WHERE username=?`, username).Scan(&pwHash); err != nil || pwHash != hashPassword(password) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="CurlSchool"`)
+		writeJSON(w, 401, map[string]any{
+			"error": "Invalid username or password.",
+			"hint":  "Use the same credentials you registered with at POST /login.",
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "basic_auth", map[string]any{
+		"method": "HTTP Basic Auth",
+		"note":   "curl -u encodes username:password as base64 in the Authorization header.",
+	}))
+}
+
+// C23: GET /moved — 301 redirect
+func handleMoved(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/ping", http.StatusMovedPermanently)
+}
+
+// C24: GET /secret-header — flag lives in a response header
+func handleSecretHeader(w http.ResponseWriter, r *http.Request) {
+	username := lookupToken(bearerToken(r))
+	if username == "" {
+		writeJSON(w, 401, map[string]any{
+			"error": "Token required.",
+			"hint":  `Login first, then add: -H "Authorization: Bearer YOUR_TOKEN"`,
+		})
+		return
+	}
+	flag, pts, already := awardFlag(username, "resp_header")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Secret-Token", flag)
+	w.Header().Set("X-Points", fmt.Sprintf("%d", pts))
+	if already {
+		w.Header().Set("X-Already-Solved", "true")
+	}
+	writeJSON(w, 200, map[string]any{
+		"message":       "The flag is hiding in the X-Secret-Token response header!",
+		"hint":          "Run with: curl -i ... to see all response headers.",
+		"points_earned": pts,
+		"your_total":    userPoints(username),
+	})
+}
+
+// C25: POST /form — URL-encoded form data
+func handleForm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"error": "POST only."})
+		return
+	}
+	username := requireAuth(w, r)
+	if username == "" {
+		return
+	}
+	if !strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		writeJSON(w, 400, map[string]any{
+			"error": "Expected Content-Type: application/x-www-form-urlencoded",
+			"hint":  `curl -d "name=alice&course=curl101" -H "Content-Type: application/x-www-form-urlencoded" ...`,
+		})
+		return
+	}
+	raw, _ := io.ReadAll(r.Body)
+	values, err := url.ParseQuery(string(raw))
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": "Could not parse form data."})
+		return
+	}
+	name := strings.TrimSpace(values.Get("name"))
+	course := strings.TrimSpace(values.Get("course"))
+	if name == "" || course == "" {
+		writeJSON(w, 400, map[string]any{
+			"error":    "Both 'name' and 'course' fields are required.",
+			"received": values,
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "form_submit", map[string]any{
+		"received": map[string]string{"name": name, "course": course},
+		"note":     "URL-encoded: key=value&key2=value2 — same format as query strings, but in the body.",
+	}))
+}
+
+// C26: GET /combo — query param + custom header required together
+func handleCombo(w http.ResponseWriter, r *http.Request) {
+	username := requireAuth(w, r)
+	if username == "" {
+		return
+	}
+	mode := r.URL.Query().Get("mode")
+	apiVer := r.Header.Get("X-Api-Version")
+	if mode != "strict" || apiVer != "2" {
+		writeJSON(w, 400, map[string]any{
+			"error":    "Both ?mode=strict AND header X-Api-Version: 2 are required.",
+			"got_mode": mode,
+			"got_ver":  apiVer,
+			"hint":     `curl "http://localhost:8080/combo?mode=strict" -H "X-Api-Version: 2" -H "Authorization: Bearer TOKEN"`,
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "query_and_hdr", map[string]any{
+		"note": "You sent a query param and a custom header in the same request!",
+	}))
+}
+
+// C27: GET /double-check — two specific custom headers required
+func handleDoubleCheck(w http.ResponseWriter, r *http.Request) {
+	username := requireAuth(w, r)
+	if username == "" {
+		return
+	}
+	first := r.Header.Get("X-First")
+	second := r.Header.Get("X-Second")
+	if first != "alpha" || second != "beta" {
+		writeJSON(w, 400, map[string]any{
+			"error":      "Requires: X-First: alpha AND X-Second: beta.",
+			"got_first":  first,
+			"got_second": second,
+			"hint":       `Add: -H "X-First: alpha" -H "X-Second: beta"`,
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "two_hdrs", map[string]any{
+		"note": "Multiple -H flags stack — each becomes its own request header.",
+	}))
+}
+
+// C28: POST /validated — JSON schema with type validation
+func handleValidated(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"error": "POST only."})
+		return
+	}
+	username := requireAuth(w, r)
+	if username == "" {
+		return
+	}
+	if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		writeJSON(w, 400, map[string]any{"error": "Expected Content-Type: application/json."})
+		return
+	}
+	raw, _ := io.ReadAll(r.Body)
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "JSON parse error."})
+		return
+	}
+	var errs []string
+	if titleStr, ok := body["title"].(string); !ok || strings.TrimSpace(titleStr) == "" {
+		errs = append(errs, "'title' (string) is required")
+	}
+	if authorStr, ok := body["author"].(string); !ok || strings.TrimSpace(authorStr) == "" {
+		errs = append(errs, "'author' (string) is required")
+	}
+	if _, ok := body["year"].(float64); !ok {
+		errs = append(errs, "'year' (number) is required")
+	}
+	if len(errs) > 0 {
+		writeJSON(w, 400, map[string]any{
+			"error":  "Validation failed.",
+			"issues": errs,
+			"hint":   `Send: {"title":"My Book","author":"Alice","year":2024}`,
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "json_validation", map[string]any{
+		"received": body,
+		"note":     "Schema validation: server enforces field types, not just presence.",
+	}))
+}
+
+// C31: POST /cookie-login
+func handleCookieLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"error": "POST only."})
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	raw, _ := io.ReadAll(r.Body)
+	if !strings.Contains(ct, "application/json") {
+		writeJSON(w, 400, map[string]any{"error": "Expected Content-Type: application/json."})
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "JSON parse error."})
+		return
+	}
+	username := strings.TrimSpace(body.Username)
+	password := strings.TrimSpace(body.Password)
+	if username == "" || password == "" {
+		writeJSON(w, 400, map[string]any{"error": "Both 'username' and 'password' are required."})
+		return
+	}
+	var pwHash string
+	if err := db.QueryRow(`SELECT password_hash FROM users WHERE username=?`, username).Scan(&pwHash); err != nil || pwHash != hashPassword(password) {
+		writeJSON(w, 401, map[string]any{"error": "Invalid username or password."})
+		return
+	}
+	sessionToken := generateToken()
+	db.Exec(`UPDATE users SET session_token=? WHERE username=?`, sessionToken, username)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    sessionToken,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   86400,
+	})
+	flag, pts, already := awardFlag(username, "cookie_save")
+	writeJSON(w, 200, map[string]any{
+		"message":        fmt.Sprintf("🍪 Session started for %s!", username),
+		"flag":           flag,
+		"points_earned":  pts,
+		"already_solved": already,
+		"next":           "Now run: curl -b cookies.txt http://localhost:8080/cookie-protected",
+		"tip":            "Re-run this request with -c cookies.txt to save the cookie to a file.",
+	})
+}
+
+// C32: GET /cookie-protected
+func handleCookieProtected(w http.ResponseWriter, r *http.Request) {
+	username := requireCookieAuth(w, r)
+	if username == "" {
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "cookie_reuse", map[string]any{
+		"note":    "curl -b sent the session cookie automatically — just like a browser!",
+		"session": "Cookie auth: server recognises you by your session ID, no manual header needed.",
+	}))
+}
+
+// C33: GET /agent-check — User-Agent must start with Mozilla
+func handleAgentCheck(w http.ResponseWriter, r *http.Request) {
+	username := requireAuth(w, r)
+	if username == "" {
+		return
+	}
+	ua := r.Header.Get("User-Agent")
+	if !strings.HasPrefix(ua, "Mozilla") {
+		writeJSON(w, 400, map[string]any{
+			"error": "User-Agent must start with 'Mozilla'.",
+			"got":   ua,
+			"hint":  `curl -H "User-Agent: Mozilla/5.0 (compatible; CurlStudent)" ...`,
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "useragent_check", map[string]any{
+		"your_ua": ua,
+		"note":    "Servers often inspect User-Agent to detect browsers vs bots.",
+	}))
+}
+
+// C34: GET /content-deal — response format depends on Accept header
+func handleContentDeal(w http.ResponseWriter, r *http.Request) {
+	username := lookupToken(bearerToken(r))
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "application/json") {
+		if username != "" {
+			writeJSON(w, 200, flagResp(username, "accept_json", map[string]any{
+				"format": "json",
+				"note":   "You asked for JSON (Accept: application/json) and got it!",
+			}))
+		} else {
+			writeJSON(w, 200, map[string]any{
+				"format":  "json",
+				"message": "JSON delivered. Add a Bearer token to earn the flag.",
+			})
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(200)
+	fmt.Fprintln(w, "Plain text response. Set Accept: application/json to get JSON (and the flag).")
+}
+
+// C40: GET /boss — mini boss
+func handleBoss(w http.ResponseWriter, r *http.Request) {
+	username := requireAuth(w, r)
+	if username == "" {
+		return
+	}
+	level := r.URL.Query().Get("level")
+	bossHdr := r.Header.Get("X-Boss")
+	accept := r.Header.Get("Accept")
+	var missing []string
+	if level != "hard" {
+		missing = append(missing, "?level=hard query param")
+	}
+	if bossHdr != "true" {
+		missing = append(missing, "X-Boss: true header")
+	}
+	if accept != "application/json" {
+		missing = append(missing, "Accept: application/json header")
+	}
+	if len(missing) > 0 {
+		writeJSON(w, 400, map[string]any{
+			"error":   "Boss challenge incomplete!",
+			"missing": missing,
+			"hint":    `curl "http://localhost:8080/boss?level=hard" -H "Authorization: Bearer TOKEN" -H "X-Boss: true" -H "Accept: application/json"`,
+		})
+		return
+	}
+	writeJSON(w, 200, flagResp(username, "mini_boss", map[string]any{
+		"note": "MINI BOSS DEFEATED! You combined auth + query param + 2 custom headers in one shot!",
+	}))
 }
 
 func logger(next http.HandlerFunc) http.HandlerFunc {
@@ -913,6 +1382,7 @@ func main() {
 		return h
 	}
 
+	// original routes
 	mux.HandleFunc("/", wrap(handleRoot))
 	mux.HandleFunc("/ping", wrap(handlePing))
 	mux.HandleFunc("/login", wrap(handleLogin))
@@ -923,9 +1393,26 @@ func main() {
 	mux.HandleFunc("/me", wrap(handleMe))
 	mux.HandleFunc("/notes", wrap(notesRouter))
 	mux.HandleFunc("/notes/", wrap(notesRouter))
+	// new routes
+	mux.HandleFunc("/basic-login", wrap(handleBasicLogin))
+	mux.HandleFunc("/moved", wrap(handleMoved))
+	mux.HandleFunc("/secret-header", wrap(handleSecretHeader))
+	mux.HandleFunc("/form", wrap(handleForm))
+	mux.HandleFunc("/combo", wrap(handleCombo))
+	mux.HandleFunc("/double-check", wrap(handleDoubleCheck))
+	mux.HandleFunc("/validated", wrap(handleValidated))
+	mux.HandleFunc("/cookie-login", wrap(handleCookieLogin))
+	mux.HandleFunc("/cookie-protected", wrap(handleCookieProtected))
+	mux.HandleFunc("/agent-check", wrap(handleAgentCheck))
+	mux.HandleFunc("/content-deal", wrap(handleContentDeal))
+	mux.HandleFunc("/boss", wrap(handleBoss))
 
+	maxScore := 0
+	for _, c := range challenges {
+		maxScore += c.Points
+	}
 	addr := fmt.Sprintf("%s:%s", *host, *port)
-	fmt.Printf("\n  🚩  CurlSchool — 20 Challenges · 600pts max\n")
+	fmt.Printf("\n  🚩  CurlSchool — %d Challenges · %dpts max\n", len(challenges), maxScore)
 	fmt.Printf("  Listening:  http://%s\n", addr)
 	fmt.Printf("  DB:         %s\n\n", *dbPath)
 	log.Fatal(http.ListenAndServe(addr, mux))
